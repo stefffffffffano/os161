@@ -53,6 +53,8 @@
 
 #if OPT_C2
 #include <synch.h>
+#include <kern/fcntl.h>
+#include <vfs.h>
 
 #define MAX_PROC 100
 static struct _processTable {
@@ -67,6 +69,40 @@ static struct _processTable {
  * The process for the kernel; this holds all the kernel-only threads.
  */
 struct proc *kproc;
+/*
+ * Function to remove a child from the parent children list
+ */
+static int proc_remove_proc(struct proc *this, struct proc *father) {
+    if (father == NULL || this == NULL) {
+        return -1; //Error
+    }
+
+    // Get the father lock to ensure synchronization
+    spinlock_acquire(&father->p_lock);
+
+    struct child_node *current = father->p_children_list;
+    struct child_node *previous = NULL;
+
+    while (current != NULL) {
+        if (current->p == this) {
+            if (previous == NULL) {
+                // It's the first one in the list
+                father->p_children_list = current->next;
+            } else {
+                previous->next = current->next;
+            }
+            kfree(current);
+            spinlock_release(&father->p_lock);
+            return 0;
+        }
+        previous = current;
+        current = current->next;
+    }
+    spinlock_release(&father->p_lock);
+
+    // Cild not found, error
+    return -1;
+}
 
 /*
  * G.Cabodi - 2019
@@ -76,6 +112,9 @@ struct proc *
 proc_search_pid(pid_t pid) {
 #if OPT_C2
   struct proc *p;
+  if(pid>MAX_PROC){
+	return NULL;
+  }
   KASSERT(pid>=0&&pid<MAX_PROC);
   p = processTable.proc[pid];
   KASSERT(p->p_pid==pid);
@@ -125,7 +164,31 @@ proc_init_waitpid(struct proc *proc, const char *name) {
   (void)name;
 #endif
 }
-
+/*
+ * Verify if there's a pid available for a new process to be created
+ */
+#if OPT_C2
+int proc_verify_pid(){
+  int i,pid=0;
+  spinlock_acquire(&processTable.lk);
+  i = processTable.last_i+1;
+  if (i>MAX_PROC) i=1;
+  while (i!=processTable.last_i) {
+    if (processTable.proc[i] == NULL) {
+    	//No assignment needed
+      	pid = i;
+      	break;
+    }
+    i++;
+    if (i>MAX_PROC) i=1;
+  }
+  spinlock_release(&processTable.lk);
+  if (pid==0) {
+    return -1;
+  }
+  return 0;
+}
+#endif
 /*
  * G.Cabodi - 2019
  * Terminate support for pid/waitpid.
@@ -151,6 +214,46 @@ proc_end_waitpid(struct proc *proc) {
   (void)proc;
 #endif
 }
+/*
+ *General purpose function used to initialize stdin,stdout and stderr to point to con:
+ */
+#if OPT_C2
+static int std_init(struct proc *proc, int fd, int mode) {
+	char *con = kstrdup("con:");
+	if (con == NULL) {
+		return -1;
+	}
+
+	/* Allocation of struct openfile */
+	proc->fileTable[fd] = (struct openfile *) kmalloc(sizeof(struct openfile));
+	if (proc->fileTable[fd] == NULL) {
+		kfree(con);
+		return -1;
+	}
+	
+	/* Opening console device */
+	int err = vfs_open(con, mode, 0644, &proc->fileTable[fd]->vn);
+	if (err) {
+		kfree(con);
+		kfree(proc->fileTable[fd]);
+		return -1;
+	}
+	kfree(con);
+
+	/* Values initialization */
+	proc->fileTable[fd]->offset = 0;
+	proc->fileTable[fd]->lock = lock_create("std");
+	if (proc->fileTable[fd]->lock == NULL) {
+		vfs_close(proc->fileTable[fd]->vn);
+		kfree(proc->fileTable[fd]);
+		return -1;
+	}
+	proc->fileTable[fd]->countRef = 1;
+	proc->fileTable[fd]->mode_open = mode;
+
+	return 0;
+}
+#endif
 
 /*
  * Create a proc structure.
@@ -173,20 +276,56 @@ proc_create(const char *name)
 
 	proc->p_numthreads = 0;
 	spinlock_init(&proc->p_lock);
-	proc->p_thread_list=NULL; //initialization of the thread list to NULL
+	proc->p_thread_list = NULL; // Initialization of the thread list to NULL
+	proc->p_children_list = NULL; // Initialization of the children list to NULL
+	proc->p_father_proc = NULL; // Initialization of the father to NULL
 	/* VM fields */
 	proc->p_addrspace = NULL;
 
 	/* VFS fields */
 	proc->p_cwd = NULL;
+	proc->p_terminated = 0; // Initialize it to zero, it is set to 1 once the process terminates
+	proc_init_waitpid(proc, name);
 
-	proc_init_waitpid(proc,name);
 #if OPT_C2
-	bzero(proc->fileTable,OPEN_MAX*sizeof(struct openfile *));
+	bzero(proc->fileTable, OPEN_MAX * sizeof(struct openfile *));
+	//It's not possible to initialize stdin,stdout,stderr here
+	//It would do it for the kernel process also
 #endif
 	return proc;
 }
 
+#if OPT_C2
+/*
+ * Check if the process identified by pid is a child of the process calling waitpid
+ */
+int check_is_child(pid_t pid){
+	struct proc *p= proc_search_pid(pid); //get the proc data structure for the process with pid=pid
+	if(p==NULL){ //if not found, it returns -1
+		return -1;
+	}
+	if(p->p_father_proc==curproc){
+		return 1;
+	}
+	return 0;
+}
+#endif
+#if OPT_C2
+/*
+ * Check if a process has a terminated child in its children list
+ */
+struct proc * check_is_terminated(struct proc *p){
+	struct child_node *current = p->p_children_list;
+	while(current!=NULL){
+		if(current->p->p_terminated==1){
+			return current->p;
+		}
+		//Go on with the list
+		current = current->next;
+	}
+	return NULL;
+}
+#endif
 /*
  * Destroy a proc structure.
  *
@@ -266,9 +405,26 @@ proc_destroy(struct proc *proc)
 		}
 		as_destroy(as);
 	}
+	//The list of children has to be deallocated
+#if OPT_C2
+	while(proc->p_children_list!=NULL){
+		struct child_node *curNode = proc->p_children_list;
+		struct child_node *nextOne = curNode->next; //The last one will point to null and the while won't enter
 
+		//call proc_destroy recursively on the child process
+		proc_destroy(curNode->p);
+		proc->p_children_list=nextOne; //go on in the list
+
+		kfree(curNode); //free the child_node structure
+	}
+	if(proc->p_father_proc != NULL){
+		//remove the child process from the list of children of the father
+		if(proc_remove_proc(proc,proc->p_father_proc)!=0){
+			panic("The child should exist in the father data structure");
+		}
+	}
+#endif 
 	KASSERT(proc->p_numthreads == 0);
-	spinlock_cleanup(&proc->p_lock);
 
 	proc_end_waitpid(proc);
 
@@ -313,7 +469,14 @@ proc_create_runprogram(const char *name)
 	/* VM fields */
 
 	newproc->p_addrspace = NULL;
-
+	/*Initialization of stdin,stdout and stderr to point to the console device*/
+	if (std_init( newproc, 0, O_RDONLY) == -1) {
+		return NULL;
+	} else if (std_init(newproc, 1, O_WRONLY) == -1) {
+		return NULL;
+	} else if (std_init(newproc, 2, O_WRONLY) == -1) {
+		return NULL;
+	}
 	/* VFS fields */
 
 	/*
@@ -502,7 +665,7 @@ int
 proc_wait(struct proc *proc)
 {
 #if OPT_C2
-        int return_status;
+    int return_status;
         /* NULL and kernel proc forbidden */
 	KASSERT(proc != NULL);
 	KASSERT(proc != kproc);

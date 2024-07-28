@@ -74,7 +74,7 @@ runprogram(char *progname)
 		vfs_close(v);
 		return ENOMEM;
 	}
-
+	
 	/* Switch to it and activate it. */
 	proc_setas(as);
 	as_activate();

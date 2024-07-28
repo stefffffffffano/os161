@@ -133,7 +133,7 @@ common_prog(int nargs, char **args)
 		return result;
 	}
 	int exit_code=proc_wait(proc);
-	kprintf("%d\n",exit_code);
+	kprintf("process terminated with exit code: %d\n",exit_code);
 
 	/*
 	 * The new process will be destroyed when the program exits...
